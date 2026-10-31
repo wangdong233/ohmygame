@@ -1,5 +1,5 @@
 import { Lightbulb, LoaderCircle, SendArrow } from "./icons.js";
-import { useEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { AgentModel, AgentModelRef, AgentReasoningLevel, ConversationCapabilities, PluginMention } from "../shared/contracts.js";
 import { clampReasoningLevel } from "../shared/reasoning.js";
 import { preferredAgentModel } from "../shared/agent-models.js";
@@ -9,7 +9,7 @@ import { AttachmentStrip, appendAttachments, attachmentFiles, type ComposerAttac
 import { composerDrafts, homeDraftScope, type SavedComposerDraft } from "./composer-drafts.js";
 import { ModelSelector, useAgentModels } from "./model-selector.js";
 import { matchesPlanCommand, PlanModeIndicator } from "./plan-mode-control.js";
-import { PromptBox, type DroppedFile } from "./prompt-box.js";
+import { PromptBox, type DroppedFile, type PromptInput, type PromptSelection } from "./prompt-box.js";
 import type { FirstMessage } from "./project-create-dialog.js";
 import { HomePluginMenu } from "./home-plugin-menu.js";
 import { PROJECT_TYPES } from "./project-types.js";
@@ -17,9 +17,8 @@ import { isAppProjectType, MORE_TYPES, openMoreProjectTypes, projectTypeOptions,
 import { Button, DropdownMenu, Select } from "./ui/index.js";
 import { PluginGlyph } from "./plugin-icons.js";
 import { useComposerContextMenu } from "./composer-context-menu.js";
-import { activePluginMentions, extractLeadingPluginMention, formatComposerInvocation, formatPluginInvocation, insertMention, parseSkillInvocation, toPluginMention, type ComposerMention, type ComposerMentionQuery } from "./composer-mentions.js";
+import { activePluginMentions, extractLeadingPluginMention, formatPluginInvocation, formatSkillInvocation, insertMention, parseSkillInvocation, toPluginMention, type ComposerMention, type ComposerMentionQuery } from "./composer-mentions.js";
 import { createPromptHistory, loadHomePromptHistory, nextPrompt, previousPrompt } from "./prompt-history.js";
-import { ComposerCapabilityReferences } from "./composer-capability-references.js";
 import { t } from "./i18n.js";
 
 const EMPTY_CAPABILITIES: ConversationCapabilities = { plugins: [], skills: [] };
@@ -64,14 +63,13 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
 }) {
   const draftSession = composerDrafts.get(homeDraftScope(draftKey));
   const draft = useSyncExternalStore(draftSession.subscribe, draftSession.getSnapshot, draftSession.getSnapshot);
-  const { prompt, selectedSkill, selectedPlugin, mentions: pluginMentions, planning, attachments } = draft;
+  const { prompt, selectedPlugin, mentions: pluginMentions, planning, attachments } = draft;
   function draftSetter<K extends keyof SavedComposerDraft>(field: K) {
     return (value: SavedComposerDraft[K] | ((current: SavedComposerDraft[K]) => SavedComposerDraft[K])) => draftSession.update((current) => ({
       [field]: typeof value === "function" ? (value as (current: SavedComposerDraft[K]) => SavedComposerDraft[K])(current[field]) : value,
     }));
   }
   const setPrompt = draftSetter("prompt");
-  const setSelectedSkill = draftSetter("selectedSkill");
   const setSelectedPlugin = draftSetter("selectedPlugin");
   const setPluginMentions = draftSetter("mentions");
   const setPlanning = draftSetter("planning");
@@ -113,13 +111,13 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
   const mentionHistory = new Map(storedHistory.map((entry) => [entry.prompt, entry.mentions]));
   // The unsent prompt's plugins, for coming back to it from history.
   const draftMentions = useRef<PluginMention[]>([]);
-  const promptRef = useRef<HTMLTextAreaElement>(null);
+  const promptRef = useRef<PromptInput>(null);
   const modelCatalog = useAgentModels({ agentRuntimes: true });
   const selectedModel = preferredAgentModel(modelCatalog.models, model, modelCatalog.defaultModel);
   const contextMenu = useComposerContextMenu({
     prompt,
     cursor: mentionCursor,
-    textarea: promptRef,
+    input: promptRef,
     disabled: creating,
     capabilities,
     planning,
@@ -171,11 +169,12 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
   const ideas: readonly IdeaKey[] = (starter && starter.name in IDEAS ? IDEAS[starter.name as keyof typeof IDEAS] : undefined) ?? GENERAL_IDEAS;
   // A plugin that adds the chosen type is on in its projects already.
   const projectPlugins = projectPluginChoices.filter((plugin) => !plugin.providesTypes.includes(type));
-  /** The prompt as sent: the skill, the chosen plugins in order, then the text. */
+  /** The prompt as sent: the chosen plugins in order, then the text with its own mentions and Skills. */
   const withExtras = (text: string, others = extraMentions) =>
     others.reduceRight((rest, mention) => formatPluginInvocation(mention, rest), text);
   const invocation = (text: string, lead = selectedPlugin, others = extraMentions) =>
-    formatComposerInvocation(selectedSkill, lead, withExtras(text, others));
+    formatPluginInvocation(lead, withExtras(text, others));
+  const skillNames = useMemo(() => capabilities.skills.map((skill) => skill.name), [capabilities.skills]);
 
   // The plugin a type comes from always leads, also after the prompt is cleared.
   // A plugin that led instead, as from history, follows it in the same order:
@@ -200,6 +199,12 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
     // A remembered plugin type that is gone takes its plugin with it.
     const lost = savedType.startsWith(STARTER_TYPE) && !typePending && selectedPlugin
       && !capabilities.plugins.some((plugin) => plugin.name === selectedPlugin.name && plugin.marketplaceId === selectedPlugin.marketplaceId);
+    // Any other plugin that led a draft saved before mentions sat in the text goes back in it.
+    if (capabilitiesLoaded && selectedPlugin && !selectedStarter && !lost) {
+      setPrompt(formatPluginInvocation(selectedPlugin, prompt));
+      setSelectedPlugin(undefined);
+      return;
+    }
     // A plugin put first in the prompt by hand is kept, and so is a starter that works in the type.
     if (!lost && (starterChosen || (selectedPlugin && (!selectedStarter || starter)))) return;
     const next = defaultStarter(starters, type);
@@ -247,7 +252,7 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
       return;
     }
     // The starting plugin alone is not a message.
-    if ((!prompt.trim() && !selectedSkill && attachments.length === 0) || creating || typePending) return;
+    if ((!prompt.trim() && attachments.length === 0) || creating || typePending) return;
     const submittedPrompt = invocation(prompt.trim());
     const submittedDraft = draft;
     onSubmit({
@@ -300,13 +305,11 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
     setPlanning((value) => !value);
     if (clearDraft) {
       setPrompt("");
-      setSelectedSkill(undefined);
       setSelectedPlugin(undefined);
       setExtraPlugins(undefined);
       setPluginMentions([]);
       setMentionCursor(0);
     }
-    if (!planning) setSelectedSkill(undefined);
     promptRef.current?.focus();
   }
 
@@ -322,50 +325,41 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
     const result = direction === "previous" ? previousPrompt(history, invocation(prompt)) : nextPrompt(history);
     if (!result) return;
     if (history.index === history.entries.length) draftMentions.current = [...pluginMentions, ...(selectedPlugin ? [selectedPlugin] : []), ...extraMentions];
-    const skill = parseSkillInvocation(result.prompt);
     const historicalMentions = mentionHistory.get(result.prompt)
       ?? (result.history.index === result.history.entries.length ? draftMentions.current : []);
-    const plugin = extractLeadingPluginMention(skill?.prompt ?? result.prompt, historicalMentions);
-    // Starting plugins that followed the first come back checked too, while they fit the type.
+    // The starting plugins that lead it come back chosen, while they fit the type; the
+    // rest of the prompt, its Skills and other mentions included, comes back as text.
+    // Prompts from before Skills sat in the text start with the Skill.
+    const skill = parseSkillInvocation(result.prompt);
     const fits = (mention: PluginMention) => starters.some((item) => item === starterOf(mention));
-    const others: PluginMention[] = [];
-    for (let next = extractLeadingPluginMention(plugin.prompt, historicalMentions); next.mention && fits(next.mention);
+    const leads: PluginMention[] = [];
+    let rest = skill?.prompt ?? result.prompt;
+    for (let next = extractLeadingPluginMention(rest, historicalMentions); next.mention && fits(next.mention);
       next = extractLeadingPluginMention(next.prompt, historicalMentions)) {
-      others.push(next.mention);
-      plugin.prompt = next.prompt;
+      leads.push(next.mention);
+      rest = next.prompt;
     }
+    const text = formatSkillInvocation(skill?.name, rest);
     setHistory(result.history);
-    setPrompt(plugin.prompt);
-    setSelectedSkill(skill?.name);
-    setSelectedPlugin(plugin.mention);
-    setExtraPlugins(others.length ? others : undefined);
+    setPrompt(text);
+    setSelectedPlugin(leads[0]);
+    setExtraPlugins(leads.length > 1 ? leads.slice(1) : undefined);
     setPluginMentions(historicalMentions);
-    const cursor = plugin.prompt.length;
-    setMentionCursor(cursor);
-    requestAnimationFrame(() => {
-      promptRef.current?.setSelectionRange(cursor, cursor);
-    });
+    setMentionCursor(text.length);
+    focusAt(text.length);
   }
 
   function clearSelectedPlugin(): void {
     setSelectedPlugin(undefined);
-    setPluginMentions((current) => activePluginMentions(formatComposerInvocation(selectedSkill, undefined, withExtras(prompt)), current));
+    setPluginMentions((current) => activePluginMentions(withExtras(prompt), current));
   }
 
   function selectMention(mention: ComposerMention, query?: ComposerMentionQuery): void {
     const activeMention = query ?? { start: mentionCursor, end: mentionCursor, trigger: "@" as const, query: "" };
-    if (mention.type === "skill") {
-      if (query) {
-        const suffix = prompt.slice(activeMention.end).replace(/^\s+/, "");
-        setPrompt(`${prompt.slice(0, activeMention.start)}${suffix}`);
-      }
-      setSelectedSkill(mention.value.name);
-      setMentionCursor(activeMention.start);
-      focusAt(activeMention.start);
-      return;
-    }
-    const selected = toPluginMention(mention.value);
-    if ((!query || activeMention.start === 0) && !selectedPlugin) {
+    const selected = mention.type === "plugin" ? toPluginMention(mention.value) : undefined;
+    // A starting plugin named first, with none chosen, is chosen as the lead.
+    const starting = selected && starters.includes(mention.value as Plugin);
+    if (selected && starting && (!query || activeMention.start === 0) && !selectedPlugin) {
       const nextPrompt = query ? prompt.slice(activeMention.end).replace(/^\s+/, "") : prompt;
       const candidates = [
         ...pluginMentions.filter((item) => item.name !== selected.name || item.marketplaceId !== selected.marketplaceId),
@@ -381,9 +375,10 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
       focusAt(0);
       return;
     }
+    // Other plugins and Skills go where they are typed, any number of each.
     const inserted = insertMention(prompt, activeMention, mention);
     changePrompt(inserted.value);
-    setPluginMentions((current) => [
+    if (selected) setPluginMentions((current) => [
       ...current.filter((item) => item.name !== selected.name || item.marketplaceId !== selected.marketplaceId),
       selected,
     ]);
@@ -392,21 +387,13 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
   }
 
   function focusAt(cursor: number): void {
-    requestAnimationFrame(() => {
-      promptRef.current?.focus();
-      promptRef.current?.setSelectionRange(cursor, cursor);
-    });
+    requestAnimationFrame(() => promptRef.current?.focus(cursor));
   }
 
-  function handleCommandKeyDown(event: KeyboardEvent<HTMLTextAreaElement>): boolean {
-    setMentionCursor(event.currentTarget.selectionStart);
+  function handleCommandKeyDown(event: KeyboardEvent, selection: PromptSelection): boolean {
+    setMentionCursor(selection.start);
     if (contextMenu.handleKeyDown(event)) return true;
-    if (selectedSkill && event.key === "Backspace" && event.currentTarget.selectionStart === 0 && event.currentTarget.selectionEnd === 0) {
-      event.preventDefault();
-      setSelectedSkill(undefined);
-      return true;
-    }
-    if (selectedPlugin && event.key === "Backspace" && event.currentTarget.selectionStart === 0 && event.currentTarget.selectionEnd === 0) {
+    if (selectedPlugin && event.key === "Backspace" && selection.start === 0 && selection.end === 0) {
       event.preventDefault();
       clearSelectedPlugin();
       return true;
@@ -434,7 +421,7 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
             <button
               className="icon-button send-button"
               type="submit"
-              disabled={(!selectedSkill && !prompt.trim() && attachments.length === 0) || creating || typePending}
+              disabled={(!prompt.trim() && attachments.length === 0) || creating || typePending}
               title={t("creator.create")}
               aria-label={t("creator.create")}
             >
@@ -444,18 +431,6 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
         )}
         content={<AttachmentStrip items={attachments} onRemove={(id) => setAttachments((items) => items.filter((attachment) => attachment.id !== id))} />}
         disabled={creating}
-        prefix={<ComposerCapabilityReferences
-          skill={selectedSkill}
-          plugin={starter ? undefined : selectedPlugin}
-          onRemoveSkill={() => {
-            setSelectedSkill(undefined);
-            promptRef.current?.focus();
-          }}
-          onRemovePlugin={() => {
-            clearSelectedPlugin();
-            promptRef.current?.focus();
-          }}
-        />}
         leading={(
           <>
             {contextMenu.button}
@@ -488,11 +463,14 @@ export function ProjectPromptCreator({ draftKey, placeholder, disabled: creating
         onSubmit={() => void submit()}
         suggestions={contextMenu.suggestions}
         overlay={contextMenu.open ? contextMenu.overlay : null}
-        placeholder={selectedSkill || (selectedPlugin && !starter) ? "" : planning ? t("creator.planPlaceholder") : placeholder}
-        textareaRef={promptRef}
+        placeholder={planning ? t("creator.planPlaceholder") : placeholder}
+        inputRef={promptRef}
         onSelectionChange={setMentionCursor}
         value={prompt}
         variant="home"
+        mentions={pluginMentions}
+        plugins={capabilities.plugins}
+        skills={skillNames}
         onDropFiles={creating ? undefined : addFiles}
         onDropError={(cause) => setError(cause.message)}
       />
